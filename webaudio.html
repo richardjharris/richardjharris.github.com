@@ -77,7 +77,7 @@
           <input
             id="gain"
             type="range"
-            value="0.1"
+            value="0.5"
             min="0.0"
             max="1.0"
             step="0.02"
@@ -101,13 +101,49 @@
           <input
             id="shape"
             type="range"
-            value="3"
+            value="5"
             min="1"
-            max="4"
+            max="5"
             step="1"
             oninput="shapeInp(value)"
           />
           <output for="shape" id="shapeVal"></output>
+
+          <label for="pulse-width">Pulse width</label>
+          <input
+            id="pulse-width"
+            type="range"
+            value="0.5"
+            min="0.01"
+            max="0.99"
+            step="0.01"
+            oninput="pulseWidthInp(value)"
+          />
+          <output for="pulse-width" id="pulseWidthVal"></output>
+
+          <label for="pulse-width">PW LFO Gain</label>
+          <input
+            id="pulse-width-lfo-gain"
+            type="range"
+            value="0.5"
+            min="0.0"
+            max="1.0"
+            step="0.05"
+            oninput="pwLfoGainInp(value)"
+          />
+          <output for="pulse-width" id="pwLfoGainVal"></output>
+
+          <label for="pulse-width">PW LFO Rate</label>
+          <input
+            id="pulse-width-lfo-rate"
+            type="range"
+            value="1.0"
+            min="0.0"
+            max="5.0"
+            step="0.5"
+            oninput="pwLfoRateInp(value)"
+          />
+          <output for="pulse-width" id="pwLfoRateVal"></output>
 
           <label for="lpf-freq">LPF Freq</label>
           <input
@@ -142,6 +178,7 @@
   <script>
     var auCtx = new AudioContext();
     var osc = auCtx.createOscillator();
+    var usingPwm = false;
     var gain = auCtx.createGain();
     var dest = auCtx.destination;
     var analyser = auCtx.createAnalyser();
@@ -149,7 +186,7 @@
 
     var lpf = auCtx.createBiquadFilter();
     lpf.type = "lowpass";
-
+  
     // Precalculate some values for the LPF setting
     var minValue = 40;
     var nyquist = auCtx.sampleRate / 2;
@@ -157,20 +194,58 @@
     // base 2 log to compute how many octaves fall in the range
     var numberOfOctaves = Math.log(maxValue / minValue) / Math.LN2;
 
+    // PWM (not connected)
+    var pwm = new GainNode(auCtx);
+    var pwmSaw1 = new OscillatorNode(auCtx, { type: 'sawtooth' });
+    var pwmSaw2 = new OscillatorNode(auCtx, { type: 'sawtooth' });
+    var inverter = new GainNode(auCtx, { gain: -1 });
+
+    // LFO for modulating delay
+    var pwmLfo = new OscillatorNode(auCtx, { type: 'triangle' });
+    pwmLfo.frequency.value = 0.5;
+    var pwmLfoGain = new GainNode(auCtx);
+    pwmLfo.connect(pwmLfoGain);
+
+
+    // Duty cycle 0-1 comes from a delay between 0 and (1/f)
+    // Default delay is 0 ? Needs updating when frequency updates?
+    // 
+    // TODO: LFO kind of works when set to nearly min values
+    // But it overwrites the original delayTime value.
+    var pwmDelay = new DelayNode(auCtx);
+    pwmLfoGain.connect(pwmDelay.delayTime);
+    pwmSaw2.connect(pwm);
+    pwmSaw1.connect(inverter);
+    inverter.connect(pwmDelay);
+    pwmDelay.connect(pwm);
+
     osc.connect(lpf);
     lpf.connect(gain);
-    gain.connect(dest);
+
+    // A signal loud enough for the analyser to display is usually too
+    // loud for the ear, so attenuate it
+    attenuator = new GainNode(auCtx, { gain: 0.1 });
+    gain.connect(attenuator);
+    attenuator.connect(dest);
 
     gain.connect(analyser);
 
-    gainInp(0.1);
-    freqInp(440.0);
-    shapeInp("3");  // ugh this needs to be a string
+    gainInp(0.5);
+    shapeInp("5");  // ugh this needs to be a string
     lpfFreqInp(1);
     lpfResInp(0.0);
+    pulseWidthInp(0.5);
+    pwLfoRateInp(0.5);
+    pwLfoGainInp(2.5);
+    // Unfortunately this needs to be last (?), if called before
+    // the pw stuff, it breaks.
+    freqInp(440.0);
 
     function start() {
       osc.start();
+      pwmSaw1.start();
+      pwmSaw2.start();
+      pwmLfo.start();
       document.querySelector("#startButton").style.display = "none";
     }
 
@@ -187,7 +262,13 @@
 
     function freqInp(val) {
       document.querySelector("#freqVal").value = freqToStr(val);
+      // TODO figure out how to drive these from a single gain
       osc.frequency.value = val;
+      pwmSaw1.frequency.value = val;
+      pwmSaw2.frequency.value = val;
+      // Update delay too, as they are based on frequency
+      pulseWidthInp(document.querySelector('#pulse-width').value);
+      pwLfoGainInp(document.querySelector('#pulse-width-lfo-gain').value);
     }
 
     function shapeInp(val) {
@@ -202,12 +283,48 @@
         case "4":
           type = "triangle";
           break;
+        case "5":
+          type = "pwm";
+          break;
         default:
           type = "sine";
           break;
       }
       document.querySelector("#shapeVal").value = type;
-      osc.type = type;
+      if (type === "pwm") {
+        // Connect up pwm osc
+        osc.disconnect(lpf);
+        pwm.connect(lpf);
+        usingPwm = true;
+        document.querySelector('#pulse-width').disabled = false;
+        document.querySelector('#pulse-width-lfo-gain').disabled = false;
+        document.querySelector('#pulse-width-lfo-rate').disabled = false;
+      } else {
+        if (usingPwm) {
+          pwm.disconnect(lpf);
+          osc.connect(lpf);
+          usingPwm = false;
+        }
+        osc.type = type;
+        document.querySelector('#pulse-width').disabled = true;
+        document.querySelector('#pulse-width-lfo-gain').disabled = true;
+        document.querySelector('#pulse-width-lfo-rate').disabled = true;
+      }
+    }
+
+    function pulseWidthInp(val) {
+      document.querySelector('#pulseWidthVal').value = val;
+      pwmDelay.delayTime.value = val * (1.0/osc.frequency.value);
+    }
+
+    function pwLfoGainInp(val) {
+      document.querySelector('#pwLfoGainVal').value = val;
+      pwmLfoGain.gain.value = ((val / 2) * (1.0/osc.frequency.value));
+    }
+
+    function pwLfoRateInp(val) {
+      document.querySelector('#pwLfoRateVal').value = val;
+      pwmLfo.frequency.setValueAtTime(val, auCtx.currentTime);
     }
 
     function lpfFreqInp(val) {
